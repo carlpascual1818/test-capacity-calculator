@@ -112,6 +112,13 @@ function App() {
   const totalProfit = useMemo(() => productResults.reduce((s, p) => s + p.netProfit, 0), [productResults]);
   const selectedKillProfile = useMemo(() => killProfiles.find(p => p.id === selectedKillProfileId), [killProfiles, selectedKillProfileId]);
   const scenarioResults = useMemo(() => calculateScenarios(totalProfit, selectedKillProfile), [totalProfit, selectedKillProfile]);
+  const testBudget = Number(selectedKillProfile?.test_budget_per_day || 0);
+  const safeCapacity = testBudget > 0 ? Math.max(0, Math.floor(totalProfit / testBudget)) : 0;
+  const conservativeCapacity = testBudget > 0 ? Math.max(0, Math.floor((totalProfit * 0.7) / testBudget)) : 0;
+  const aggressiveCapacity = testBudget > 0 ? Math.max(0, Math.floor((totalProfit + testBudget) / testBudget)) : 0;
+  const bufferAfterSafe = totalProfit - (safeCapacity * testBudget);
+  const nextTestShortfall = testBudget > 0 ? Math.max(0, ((safeCapacity + 1) * testBudget) - totalProfit) : 0;
+  const capacityStatus = safeCapacity >= 3 ? 'good' : safeCapacity >= 1 ? 'ok' : 'bad';
 
   // Winning Products CRUD
   async function addWinningProduct() {
@@ -489,6 +496,64 @@ function App() {
             </div>
           </section>
 
+          {/* Decision card */}
+          <section className={`decision-card ${capacityStatus}`}>
+            <div className="decision-main">
+              <div>
+                <div className="eyebrow">Main answer</div>
+                <h2>Safe test capacity today</h2>
+                <p>Based on your active winners and the max loss allowed per failed test.</p>
+              </div>
+              <div className="decision-number">
+                <strong>{calcBusy ? '…' : safeCapacity}</strong>
+                <span>new product{safeCapacity === 1 ? '' : 's'}</span>
+              </div>
+            </div>
+
+            <div className="decision-summary">
+              <div>
+                <span>Winner profit available</span>
+                <strong>{money(totalProfit)}/day</strong>
+              </div>
+              <div>
+                <span>Max loss per failed test</span>
+                <strong>{testBudget > 0 ? `${currSymbol}${testBudget.toFixed(2)}/day` : '—'}</strong>
+              </div>
+              <div>
+                <span>Buffer after {safeCapacity} test{safeCapacity === 1 ? '' : 's'}</span>
+                <strong className={bufferAfterSafe >= 0 ? 'positive' : 'negative'}>{money(bufferAfterSafe)}/day</strong>
+              </div>
+              <div>
+                <span>Cash needed for next test</span>
+                <strong>{nextTestShortfall > 0 ? money(nextTestShortfall) : money(0)}</strong>
+              </div>
+            </div>
+
+            <div className="capacity-modes">
+              <div>
+                <span>Conservative</span>
+                <strong>{conservativeCapacity}</strong>
+                <small>Keeps 30% profit untouched</small>
+              </div>
+              <div className="active-mode">
+                <span>Balanced</span>
+                <strong>{safeCapacity}</strong>
+                <small>Uses winner profit only</small>
+              </div>
+              <div>
+                <span>Aggressive</span>
+                <strong>{aggressiveCapacity}</strong>
+                <small>Allows one test budget risk</small>
+              </div>
+            </div>
+
+            <p className="decision-note">
+              {safeCapacity > 0
+                ? `You can run ${safeCapacity} new product test${safeCapacity === 1 ? '' : 's'} without going past today's winner profit. Running ${safeCapacity + 1} would need ${money(nextTestShortfall)} extra cash.`
+                : `Your active winners do not cover one full test today. Lower the test budget, add more winning profit, or wait before testing.`}
+            </p>
+          </section>
+
           {/* Metrics */}
           <div className="metrics-row">
             <div className={`metric-card ${totalProfit >= 0 ? 'profit' : 'loss'}`}>
@@ -505,7 +570,7 @@ function App() {
             </div>
             <div className="metric-card">
               <div className="metric-val">{selectedKillProfile ? `$${selectedKillProfile.test_budget_per_day}` : '—'}</div>
-              <div className="metric-lbl">Test budget per product/day</div>
+              <div className="metric-lbl">Max loss per failed test/day</div>
             </div>
           </div>
 
