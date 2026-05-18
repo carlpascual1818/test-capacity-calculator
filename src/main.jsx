@@ -1,12 +1,29 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Plus, Trash2, Save, RefreshCcw, LogOut, Calculator, Settings, FolderOpen } from 'lucide-react';
+import { Plus, Trash2, Save, RefreshCcw, LogOut, Calculator, Settings, FolderOpen, ArrowRight } from 'lucide-react';
 import { supabase } from './lib/supabase';
 import { calculateProduct, calculateScenarios } from './lib/calc';
 import './styles.css';
 
 const CURRENCIES = ['USD', 'GBP', 'EUR', 'HKD', 'CAD', 'AUD', 'CHF', 'SEK', 'NOK', 'DKK', 'MXN', 'SGD'];
 const CURRENCY_SYMBOLS = { USD: '$', GBP: '£', EUR: '€', HKD: 'HK$', CAD: 'C$', AUD: 'A$', CHF: 'Fr', SEK: 'kr', NOK: 'kr', DKK: 'kr', MXN: '$', SGD: 'S$' };
+
+const CONDITIONS = [
+  { value: 'no_atc', label: 'No ATC' },
+  { value: 'no_purchase', label: 'No purchase' },
+  { value: 'no_sales', label: 'No sales' },
+  { value: 'profitable', label: 'Profitable' },
+  { value: 'roas_below', label: 'ROAS below threshold' },
+];
+
+const OUTCOMES = [
+  { value: 'kill', label: 'Kill' },
+  { value: 'continue', label: 'Continue' },
+];
+
+function newRule() {
+  return { id: crypto.randomUUID(), name: '', spend_threshold: 50, condition: 'no_purchase', outcome: 'kill' };
+}
 
 function App() {
   const [session, setSession] = useState(null);
@@ -16,6 +33,7 @@ function App() {
   const [message, setMessage] = useState('');
 
   const [winningProducts, setWinningProducts] = useState([]);
+  const [processors, setProcessors] = useState([]);
   const [killProfiles, setKillProfiles] = useState([]);
   const [scenarios, setScenarios] = useState([]);
 
@@ -26,31 +44,23 @@ function App() {
 
   const [productResults, setProductResults] = useState([]);
   const [calcBusy, setCalcBusy] = useState(false);
-
   const [busy, setBusy] = useState(false);
   const [activeTab, setActiveTab] = useState('calculator');
 
   const currSymbol = CURRENCY_SYMBOLS[displayCurrency] || '$';
-  function money(v) {
-    const n = Number(v || 0);
-    return (n < 0 ? '-' : '') + currSymbol + Math.abs(n).toFixed(2);
-  }
-  function num(v) { return Number(v || 0).toFixed(2); }
+  const money = v => { const n = Number(v || 0); return (n < 0 ? '-' : '') + currSymbol + Math.abs(n).toFixed(2); };
+  const num = v => Number(v || 0).toFixed(2);
 
-  // Auth
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
     const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  useEffect(() => {
-    if (session) loadData();
-  }, [session]);
+  useEffect(() => { if (session) loadData(); }, [session]);
 
   async function handleAuth(e) {
-    e.preventDefault();
-    setBusy(true); setMessage('');
+    e.preventDefault(); setBusy(true); setMessage('');
     try {
       const fn = authMode === 'signUp' ? supabase.auth.signUp : supabase.auth.signInWithPassword;
       const { error } = await fn.call(supabase.auth, { email, password });
@@ -63,13 +73,15 @@ function App() {
   async function loadData() {
     setBusy(true);
     try {
-      const [wp, kp, sc] = await Promise.all([
+      const [wp, pp, kp, sc] = await Promise.all([
         supabase.from('winning_products').select('*').order('created_at'),
+        supabase.from('payment_processors').select('*').order('created_at'),
         supabase.from('kill_profiles').select('*').order('created_at'),
         supabase.from('scenarios').select('*').order('created_at', { ascending: false }),
       ]);
-      for (const r of [wp, kp, sc]) if (r.error) throw r.error;
+      for (const r of [wp, pp, kp, sc]) if (r.error) throw r.error;
       setWinningProducts(wp.data);
+      setProcessors(pp.data);
       setKillProfiles(kp.data);
       setScenarios(sc.data);
       setActiveProductIds(wp.data.map(p => p.id));
@@ -78,54 +90,42 @@ function App() {
     finally { setBusy(false); }
   }
 
-  // Recalculate whenever active products or display currency changes
   const calcKey = useMemo(
-    () => activeProductIds.join(',') + '|' + displayCurrency + '|' + winningProducts.map(p => JSON.stringify(p)).join(','),
-    [activeProductIds, displayCurrency, winningProducts]
+    () => activeProductIds.join(',') + '|' + displayCurrency + '|' +
+      winningProducts.map(p => JSON.stringify(p)).join(',') + '|' +
+      processors.map(p => JSON.stringify(p)).join(','),
+    [activeProductIds, displayCurrency, winningProducts, processors]
   );
 
   useEffect(() => {
-    const activeProducts = winningProducts.filter(p => activeProductIds.includes(p.id));
-    if (!activeProducts.length) { setProductResults([]); return; }
+    const active = winningProducts.filter(p => activeProductIds.includes(p.id));
+    if (!active.length) { setProductResults([]); return; }
     let cancelled = false;
     setCalcBusy(true);
-    Promise.all(activeProducts.map(p => calculateProduct(p, displayCurrency).then(r => ({ ...p, ...r }))))
+    Promise.all(active.map(p => calculateProduct(p, processors, displayCurrency).then(r => ({ ...p, ...r }))))
       .then(results => { if (!cancelled) setProductResults(results); })
       .catch(err => { if (!cancelled) setMessage(err.message); })
       .finally(() => { if (!cancelled) setCalcBusy(false); });
     return () => { cancelled = true; };
   }, [calcKey]);
 
-  const totalProfit = useMemo(
-    () => productResults.reduce((sum, p) => sum + p.netProfit, 0),
-    [productResults]
-  );
+  const totalProfit = useMemo(() => productResults.reduce((s, p) => s + p.netProfit, 0), [productResults]);
+  const selectedKillProfile = useMemo(() => killProfiles.find(p => p.id === selectedKillProfileId), [killProfiles, selectedKillProfileId]);
+  const scenarioResults = useMemo(() => calculateScenarios(totalProfit, selectedKillProfile), [totalProfit, selectedKillProfile]);
 
-  const selectedKillProfile = useMemo(
-    () => killProfiles.find(p => p.id === selectedKillProfileId),
-    [killProfiles, selectedKillProfileId]
-  );
-
-  const scenarioResults = useMemo(
-    () => calculateScenarios(totalProfit, selectedKillProfile),
-    [totalProfit, selectedKillProfile]
-  );
-
-  // Winning product CRUD
+  // Winning Products CRUD
   async function addWinningProduct() {
-    const item = { name: 'New Product', currency: 'USD', daily_ad_spend: 100, roas: 1.5, variable_cost_pct: 18.5, opex_share: 0 };
+    const item = { name: 'New Product', currency: 'USD', daily_ad_spend: 100, roas: 1.5, cogs_pct: 12, aov: 40, opex_share: 0 };
     const { data, error } = await supabase.from('winning_products').insert(item).select().single();
     if (error) return setMessage(error.message);
     setWinningProducts(prev => [...prev, data]);
     setActiveProductIds(prev => [...prev, data.id]);
   }
-
   async function updateWP(id, patch) {
     setWinningProducts(prev => prev.map(x => x.id === id ? { ...x, ...patch } : x));
     const { error } = await supabase.from('winning_products').update(patch).eq('id', id);
     if (error) setMessage(error.message);
   }
-
   async function removeWP(id) {
     setWinningProducts(prev => prev.filter(x => x.id !== id));
     setActiveProductIds(prev => prev.filter(pid => pid !== id));
@@ -133,21 +133,42 @@ function App() {
     if (error) setMessage(error.message);
   }
 
-  // Kill profile CRUD
+  // Processors CRUD
+  async function addProcessor() {
+    const item = { name: 'New Processor', percent_fee: 0, fixed_fee: 0, fixed_fee_currency: 'USD', conversion_fee_percent: 0, active: true };
+    const { data, error } = await supabase.from('payment_processors').insert(item).select().single();
+    if (error) return setMessage(error.message);
+    setProcessors(prev => [...prev, data]);
+  }
+  async function updateProcessor(id, patch) {
+    setProcessors(prev => prev.map(x => x.id === id ? { ...x, ...patch } : x));
+    const { error } = await supabase.from('payment_processors').update(patch).eq('id', id);
+    if (error) setMessage(error.message);
+  }
+  async function removeProcessor(id) {
+    setProcessors(prev => prev.filter(x => x.id !== id));
+    const { error } = await supabase.from('payment_processors').delete().eq('id', id);
+    if (error) setMessage(error.message);
+  }
+
+  // Kill Profiles CRUD
   async function addKillProfile() {
-    const item = { name: 'New Kill Profile', test_budget_per_day: 100, kill1_no_atc: 30, kill2_no_purchase: 50, kill3_day2_no_sales: 50 };
+    const defaultRules = [
+      { id: crypto.randomUUID(), name: 'No ATC by $30', spend_threshold: 30, condition: 'no_atc', outcome: 'kill' },
+      { id: crypto.randomUUID(), name: 'No purchase by $50', spend_threshold: 50, condition: 'no_purchase', outcome: 'kill' },
+      { id: crypto.randomUUID(), name: 'Profitable Day 1 — continue', spend_threshold: 100, condition: 'profitable', outcome: 'continue' },
+    ];
+    const item = { name: 'New Kill Profile', test_budget_per_day: 100, rules: defaultRules };
     const { data, error } = await supabase.from('kill_profiles').insert(item).select().single();
     if (error) return setMessage(error.message);
     setKillProfiles(prev => [...prev, data]);
     if (!selectedKillProfileId) setSelectedKillProfileId(data.id);
   }
-
   async function updateKP(id, patch) {
     setKillProfiles(prev => prev.map(x => x.id === id ? { ...x, ...patch } : x));
     const { error } = await supabase.from('kill_profiles').update(patch).eq('id', id);
     if (error) setMessage(error.message);
   }
-
   async function removeKP(id) {
     setKillProfiles(prev => prev.filter(x => x.id !== id));
     if (selectedKillProfileId === id) setSelectedKillProfileId(killProfiles.filter(x => x.id !== id)[0]?.id || '');
@@ -155,10 +176,28 @@ function App() {
     if (error) setMessage(error.message);
   }
 
+  // Rule management within a kill profile
+  function addRule(profileId) {
+    const profile = killProfiles.find(p => p.id === profileId);
+    if (!profile) return;
+    const rules = [...(profile.rules || []), newRule()];
+    updateKP(profileId, { rules });
+  }
+  function updateRule(profileId, ruleId, patch) {
+    const profile = killProfiles.find(p => p.id === profileId);
+    if (!profile) return;
+    const rules = (profile.rules || []).map(r => r.id === ruleId ? { ...r, ...patch } : r);
+    updateKP(profileId, { rules });
+  }
+  function removeRule(profileId, ruleId) {
+    const profile = killProfiles.find(p => p.id === profileId);
+    if (!profile) return;
+    const rules = (profile.rules || []).filter(r => r.id !== ruleId);
+    updateKP(profileId, { rules });
+  }
+
   function toggleProduct(id) {
-    setActiveProductIds(prev =>
-      prev.includes(id) ? prev.filter(pid => pid !== id) : [...prev, id]
-    );
+    setActiveProductIds(prev => prev.includes(id) ? prev.filter(pid => pid !== id) : [...prev, id]);
   }
 
   async function saveScenario() {
@@ -168,7 +207,6 @@ function App() {
     setScenarios(prev => [data, ...prev]);
     setMessage('Scenario saved.');
   }
-
   function loadScenario(s) {
     setScenarioName(s.name);
     setActiveProductIds(s.active_product_ids || []);
@@ -176,14 +214,13 @@ function App() {
     setDisplayCurrency(s.display_currency || 'USD');
   }
 
-  // Auth screen
   if (!session) {
     return (
       <main className="auth-page">
         <section className="auth-card">
           <div className="brand-mark">TC</div>
           <h1>Test Capacity Calculator</h1>
-          <p>Sign in to manage your winning products, kill rule profiles, and saved scenarios.</p>
+          <p>Sign in to manage your winning products, processors, kill rule profiles, and saved scenarios.</p>
           <form onSubmit={handleAuth} className="stack auth-form">
             <input placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
             <input placeholder="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} />
@@ -204,15 +241,11 @@ function App() {
         <div>
           <div className="eyebrow">Testing workspace</div>
           <h1>Test Capacity Calculator</h1>
-          <p>Know exactly how many products you can test simultaneously without putting your winners at risk. Add your winning products, set your kill rules, and see your safe test ceiling.</p>
+          <p>Know exactly how many products you can test simultaneously without putting your winners at risk. Configure your winning products, processors, and kill rules — then see your safe test ceiling.</p>
         </div>
         <div className="top-actions">
-          <button className={activeTab === 'calculator' ? '' : 'secondary'} onClick={() => setActiveTab('calculator')}>
-            <Calculator size={16} /> Calculator
-          </button>
-          <button className={activeTab === 'settings' ? '' : 'secondary'} onClick={() => setActiveTab('settings')}>
-            <Settings size={16} /> Settings
-          </button>
+          <button className={activeTab === 'calculator' ? '' : 'secondary'} onClick={() => setActiveTab('calculator')}><Calculator size={16} /> Calculator</button>
+          <button className={activeTab === 'settings' ? '' : 'secondary'} onClick={() => setActiveTab('settings')}><Settings size={16} /> Settings</button>
           <button className="secondary" onClick={loadData}><RefreshCcw size={16} /> Refresh</button>
           <button className="secondary" onClick={() => supabase.auth.signOut()}><LogOut size={16} /> Sign out</button>
         </div>
@@ -220,68 +253,151 @@ function App() {
 
       {message && <div className="notice">{message}</div>}
 
-      {/* SETTINGS TAB */}
+      {/* SETTINGS */}
       {activeTab === 'settings' && (
         <section className="settings-center panel wide">
           <div className="section-head wrap">
-            <PanelTitle title="Settings" subtitle="Manage winning products and kill rule profiles. Changes save automatically to Supabase." />
+            <PanelTitle title="Settings" subtitle="Manage winning products, payment processors, and kill rule profiles. Changes save automatically." />
             <button className="secondary small" onClick={() => setActiveTab('calculator')}>Back to calculator</button>
           </div>
 
-          <div className="settings-grid">
-            <div className="settings-card">
-              <div className="section-head">
-                <PanelTitle title="Winning products" subtitle="Your active campaigns generating daily profit. Each product's net profit contributes to your test budget." />
-                <button onClick={addWinningProduct}><Plus size={16} /> Add product</button>
-              </div>
-              <div className="field-header wp-entity">
-                <span>Name</span><span>Currency</span><span>Ad spend/day</span><span>ROAS</span><span>Var cost %</span><span>OPEX share/day</span><span></span>
-              </div>
-              <div className="entity-list">
-                {winningProducts.map(p => (
-                  <div className="entity wp-entity" key={p.id}>
-                    <input value={p.name} onChange={e => updateWP(p.id, { name: e.target.value })} />
-                    <select value={p.currency || 'USD'} onChange={e => updateWP(p.id, { currency: e.target.value })}>
-                      {CURRENCIES.map(c => <option key={c}>{c}</option>)}
-                    </select>
-                    <input type="number" step="1" value={p.daily_ad_spend} onChange={e => updateWP(p.id, { daily_ad_spend: Number(e.target.value) })} />
-                    <input type="number" step="0.01" value={p.roas} onChange={e => updateWP(p.id, { roas: Number(e.target.value) })} />
-                    <input type="number" step="0.1" value={p.variable_cost_pct} onChange={e => updateWP(p.id, { variable_cost_pct: Number(e.target.value) })} />
-                    <input type="number" step="0.01" value={p.opex_share} onChange={e => updateWP(p.id, { opex_share: Number(e.target.value) })} />
-                    <button className="icon" onClick={() => removeWP(p.id)} title="Delete"><Trash2 size={16} /></button>
-                  </div>
-                ))}
-                {!winningProducts.length && <p className="empty-text">No winning products yet. Click Add product to get started.</p>}
-              </div>
+          {/* Winning Products */}
+          <div className="settings-card settings-full">
+            <div className="section-head">
+              <PanelTitle title="Winning products" subtitle="Active campaigns generating daily profit. COGS % and processor fees are calculated separately." />
+              <button onClick={addWinningProduct}><Plus size={16} /> Add product</button>
             </div>
+            <div className="field-header wp-entity">
+              <span>Name</span><span>Currency</span><span>Avg spend/day ⓘ</span><span>3-day ROAS</span><span>COGS %</span><span>AOV</span><span>BEROAS</span><span>OPEX/day</span><span></span>
+            </div>
+            <div className="entity-list">
+              {winningProducts.map(p => (
+                <div className="entity wp-entity" key={p.id}>
+                  <input value={p.name} onChange={e => updateWP(p.id, { name: e.target.value })} />
+                  <select value={p.currency || 'USD'} onChange={e => updateWP(p.id, { currency: e.target.value })}>
+                    {CURRENCIES.map(c => <option key={c}>{c}</option>)}
+                  </select>
+                  <input type="number" step="1" value={p.daily_ad_spend} onChange={e => updateWP(p.id, { daily_ad_spend: Number(e.target.value) })} />
+                  <input type="number" step="0.01" value={p.roas} onChange={e => updateWP(p.id, { roas: Number(e.target.value) })} />
+                  <input type="number" step="0.1" value={p.cogs_pct} onChange={e => updateWP(p.id, { cogs_pct: Number(e.target.value) })} />
+                  <input type="number" step="0.01" value={p.aov} onChange={e => updateWP(p.id, { aov: Number(e.target.value) })} />
+                  <input type="number" step="0.01" value={p.beroas ?? 1.28} onChange={e => updateWP(p.id, { beroas: Number(e.target.value) })} />
+                  <input type="number" step="0.01" value={p.opex_share} onChange={e => updateWP(p.id, { opex_share: Number(e.target.value) })} />
+                  <button className="icon" onClick={() => removeWP(p.id)} title="Delete"><Trash2 size={16} /></button>
+                </div>
+              ))}
+              {!winningProducts.length && <p className="empty-text">No winning products yet. Click Add product to get started.</p>}
+            </div>
+          </div>
 
-            <div className="settings-card">
-              <div className="section-head">
-                <PanelTitle title="Kill rule profiles" subtitle="Save different kill rule configs. Switch between them in the calculator without changing your product settings." />
-                <button onClick={addKillProfile}><Plus size={16} /> Add profile</button>
-              </div>
-              <div className="field-header kp-entity">
-                <span>Name</span><span>Budget/day</span><span>Kill: no ATC</span><span>Kill: no purchase</span><span>Kill: Day 2</span><span></span>
-              </div>
-              <div className="entity-list">
-                {killProfiles.map(p => (
-                  <div className="entity kp-entity" key={p.id}>
-                    <input value={p.name} onChange={e => updateKP(p.id, { name: e.target.value })} />
-                    <input type="number" step="1" value={p.test_budget_per_day} onChange={e => updateKP(p.id, { test_budget_per_day: Number(e.target.value) })} />
-                    <input type="number" step="1" value={p.kill1_no_atc} onChange={e => updateKP(p.id, { kill1_no_atc: Number(e.target.value) })} />
-                    <input type="number" step="1" value={p.kill2_no_purchase} onChange={e => updateKP(p.id, { kill2_no_purchase: Number(e.target.value) })} />
-                    <input type="number" step="1" value={p.kill3_day2_no_sales} onChange={e => updateKP(p.id, { kill3_day2_no_sales: Number(e.target.value) })} />
-                    <button className="icon" onClick={() => removeKP(p.id)} title="Delete"><Trash2 size={16} /></button>
+          {/* Payment Processors */}
+          <div className="settings-card settings-full">
+            <div className="section-head">
+              <PanelTitle title="Payment processors" subtitle="Active processors are averaged for fee calculations across all winning products." />
+              <button onClick={addProcessor}><Plus size={16} /> Add processor</button>
+            </div>
+            <div className="field-header processor-entity">
+              <span>Name</span><span>% fee</span><span>Fixed fee</span><span>Fixed currency</span><span>FX %</span><span>Active</span><span></span>
+            </div>
+            <div className="entity-list">
+              {processors.map(p => (
+                <div className="entity processor-entity" key={p.id}>
+                  <input value={p.name} onChange={e => updateProcessor(p.id, { name: e.target.value })} />
+                  <input type="number" step="0.01" value={p.percent_fee} onChange={e => updateProcessor(p.id, { percent_fee: Number(e.target.value) })} />
+                  <input type="number" step="0.01" value={p.fixed_fee} onChange={e => updateProcessor(p.id, { fixed_fee: Number(e.target.value) })} />
+                  <select value={p.fixed_fee_currency} onChange={e => updateProcessor(p.id, { fixed_fee_currency: e.target.value })}>
+                    {CURRENCIES.map(c => <option key={c}>{c}</option>)}
+                  </select>
+                  <input type="number" step="0.01" value={p.conversion_fee_percent} onChange={e => updateProcessor(p.id, { conversion_fee_percent: Number(e.target.value) })} />
+                  <label className="switch"><input type="checkbox" checked={p.active} onChange={e => updateProcessor(p.id, { active: e.target.checked })} /><span /></label>
+                  <button className="icon" onClick={() => removeProcessor(p.id)} title="Delete"><Trash2 size={16} /></button>
+                </div>
+              ))}
+              {!processors.length && <p className="empty-text">No processors yet. Add Shopify Payments, Stripe, or any processor you use.</p>}
+            </div>
+          </div>
+
+          {/* Kill Profiles */}
+          <div className="settings-card settings-full">
+            <div className="section-head">
+              <PanelTitle title="Kill rule profiles" subtitle="Each profile has its own set of rules. Rules define spend thresholds, conditions, and outcomes — kill or continue." />
+              <button onClick={addKillProfile}><Plus size={16} /> Add profile</button>
+            </div>
+            <div className="entity-list">
+              {killProfiles.map(profile => (
+                <div className="kill-profile-card" key={profile.id}>
+                  <div className="kill-profile-header">
+                    <div className="kill-profile-meta">
+                      <input
+                        className="kill-profile-name"
+                        value={profile.name}
+                        onChange={e => updateKP(profile.id, { name: e.target.value })}
+                        placeholder="Profile name"
+                      />
+                      <label className="field-inline">
+                        <span>Test budget/day</span>
+                        <input type="number" step="1" value={profile.test_budget_per_day}
+                          onChange={e => updateKP(profile.id, { test_budget_per_day: Number(e.target.value) })} />
+                      </label>
+                    </div>
+                    <div className="kill-profile-actions">
+                      <button className="secondary small" onClick={() => addRule(profile.id)}><Plus size={14} /> Add rule</button>
+                      <button className="icon" onClick={() => removeKP(profile.id)} title="Delete profile"><Trash2 size={16} /></button>
+                    </div>
                   </div>
-                ))}
-                {!killProfiles.length && <p className="empty-text">No kill profiles yet. Click Add profile to create one.</p>}
-              </div>
+
+                  {(profile.rules || []).length > 0 && (
+                    <div className="rules-list">
+                      <div className="rules-header">
+                        <span>Rule name</span><span>Spend at ($)</span><span>ROAS threshold</span><span>Condition</span><span>Outcome</span><span></span>
+                      </div>
+                      {(profile.rules || []).map(rule => (
+                        <div className="rule-row" key={rule.id}>
+                          <input value={rule.name} placeholder="e.g. No ATC by $30"
+                            onChange={e => updateRule(profile.id, rule.id, { name: e.target.value })} />
+                          <div className="rule-threshold">
+                            <span className="threshold-prefix">$</span>
+                            <input type="number" step="1" value={rule.spend_threshold}
+                              onChange={e => updateRule(profile.id, rule.id, { spend_threshold: Number(e.target.value) })} />
+                          </div>
+                          <div className="rule-threshold">
+                            {rule.condition === 'roas_below' ? (
+                              <>
+                                <span className="threshold-prefix">≤</span>
+                                <input type="number" step="0.01" value={rule.roas_threshold ?? 1.28}
+                                  onChange={e => updateRule(profile.id, rule.id, { roas_threshold: Number(e.target.value) })} />
+                              </>
+                            ) : (
+                              <input disabled placeholder="N/A" style={{ opacity: 0.35 }} />
+                            )}
+                          </div>
+                          <select value={rule.condition}
+                            onChange={e => updateRule(profile.id, rule.id, { condition: e.target.value })}>
+                            {CONDITIONS.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
+                          </select>
+                          <select value={rule.outcome}
+                            onChange={e => updateRule(profile.id, rule.id, { outcome: e.target.value })}>
+                            {OUTCOMES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                          </select>
+                          <button className="icon small-icon" onClick={() => removeRule(profile.id, rule.id)} title="Delete rule">
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {!(profile.rules || []).length && (
+                    <p className="empty-text" style={{ marginTop: 10 }}>No rules yet. Click Add rule to define kill or continue conditions.</p>
+                  )}
+                </div>
+              ))}
+              {!killProfiles.length && <p className="empty-text">No kill profiles yet. Click Add profile to create one.</p>}
             </div>
           </div>
         </section>
       )}
 
-      {/* CALCULATOR TAB */}
+      {/* CALCULATOR */}
       {activeTab === 'calculator' && (
         <>
           <section className="workspace-bar panel">
@@ -290,6 +406,7 @@ function App() {
               <h2>{scenarioName}</h2>
               <p>
                 {productResults.length} winning product{productResults.length !== 1 ? 's' : ''} active
+                {' '}· {processors.filter(p => p.active).length} processor{processors.filter(p => p.active).length !== 1 ? 's' : ''} active
                 {selectedKillProfile ? ` · ${selectedKillProfile.name}` : ' · No kill profile selected'}
                 {' '}· Results in {displayCurrency}
                 {calcBusy && ' · Fetching FX rates…'}
@@ -305,9 +422,7 @@ function App() {
             <div className="panel scenario-panel">
               <PanelTitle title="Scenario setup" subtitle="Select which winning products and kill rule profile to use for this calculation." />
               <div className="form-grid three-cols" style={{ marginTop: 14 }}>
-                <Field label="Scenario name">
-                  <input value={scenarioName} onChange={e => setScenarioName(e.target.value)} />
-                </Field>
+                <Field label="Scenario name"><input value={scenarioName} onChange={e => setScenarioName(e.target.value)} /></Field>
                 <Field label="Kill rule profile">
                   <select value={selectedKillProfileId} onChange={e => setSelectedKillProfileId(e.target.value)}>
                     {!killProfiles.length && <option value="">No profiles — add in Settings</option>}
@@ -321,15 +436,18 @@ function App() {
                 </Field>
               </div>
 
-              {selectedKillProfile && (
-                <div style={{ marginTop: 14, padding: '12px 14px', background: '#f8fafc', borderRadius: 14, border: '1px solid var(--line)' }}>
+              {selectedKillProfile && (selectedKillProfile.rules || []).length > 0 && (
+                <div style={{ marginTop: 14 }}>
                   <div style={{ fontSize: 11, fontWeight: 900, textTransform: 'uppercase', letterSpacing: '.07em', color: 'var(--muted)', marginBottom: 8 }}>
-                    Kill thresholds — {selectedKillProfile.name}
+                    Rules — {selectedKillProfile.name}
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
-                    <KillStat label="Day 1 no ATC" value={`$${selectedKillProfile.kill1_no_atc}`} />
-                    <KillStat label="Day 1 no purchase" value={`$${selectedKillProfile.kill2_no_purchase}`} />
-                    <KillStat label="Day 2 no sales" value={`+$${selectedKillProfile.kill3_day2_no_sales}`} />
+                  <div className="rule-pills">
+                    {(selectedKillProfile.rules || []).map(rule => (
+                      <div key={rule.id} className={`rule-pill ${rule.outcome}`}>
+                        <span className="rule-pill-name">{rule.name || `$${rule.spend_threshold} ${rule.condition}`}</span>
+                        <span className={`rule-pill-outcome ${rule.outcome}`}>{rule.outcome === 'kill' ? 'Kill' : 'Continue'}</span>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}
@@ -338,13 +456,12 @@ function App() {
                 <div className="mini-title"><FolderOpen size={14} /> Saved scenarios</div>
                 {scenarios.length
                   ? <div className="chips">{scenarios.map(s => <button key={s.id} className="chip" onClick={() => loadScenario(s)}>{s.name}</button>)}</div>
-                  : <p className="empty-text">No saved scenarios yet. Configure and click Save scenario.</p>
-                }
+                  : <p className="empty-text">No saved scenarios yet. Configure and click Save scenario.</p>}
               </div>
             </div>
 
             <div className="panel">
-              <PanelTitle title="Winning products" subtitle="Toggle which products contribute to your daily testing budget. All active products are summed." />
+              <PanelTitle title="Winning products" subtitle="Toggle which products contribute to your daily testing budget." />
               <div className="product-toggle-list" style={{ marginTop: 14 }}>
                 {winningProducts.map(p => {
                   const isActive = activeProductIds.includes(p.id);
@@ -358,9 +475,7 @@ function App() {
                         </label>
                         <div>
                           <strong>{p.name}</strong>
-                          <span className="product-meta">
-                            {p.currency} {p.daily_ad_spend}/day · ROAS {Number(p.roas).toFixed(2)} · {p.variable_cost_pct}% var cost
-                          </span>
+                          <span className="product-meta">{p.currency} {p.daily_ad_spend}/day · ROAS {Number(p.roas).toFixed(2)} · {p.cogs_pct}% COGS</span>
                         </div>
                       </div>
                       <div className={`product-profit ${!isActive ? 'inactive-profit' : result ? (result.netProfit >= 0 ? 'positive' : 'negative') : ''}`}>
@@ -374,6 +489,7 @@ function App() {
             </div>
           </section>
 
+          {/* Metrics */}
           <div className="metrics-row">
             <div className={`metric-card ${totalProfit >= 0 ? 'profit' : 'loss'}`}>
               <div className="metric-val">{calcBusy ? '…' : money(totalProfit)}</div>
@@ -393,57 +509,71 @@ function App() {
             </div>
           </div>
 
-          {productResults.length > 1 && (
+          {/* Per-product breakdown */}
+          {productResults.length > 0 && (
             <section className="panel wide" style={{ marginBottom: 16 }}>
-              <PanelTitle title="Per-product breakdown" subtitle="Individual contribution of each active winning product to the shared testing budget." />
+              <PanelTitle title="Per-product breakdown" subtitle="Individual cost split per active winning product. All values in display currency." />
               <div className="table-card" style={{ marginTop: 14 }}>
                 <table>
                   <thead>
                     <tr>
-                      <th>Product</th><th>Currency</th><th>Ad spend/day</th><th>ROAS</th>
-                      <th>Net sales/day</th><th>Var costs</th><th>OPEX share</th><th>Net profit/day</th><th>BER</th>
+                      <th>Product</th><th>Ad spend</th><th>Net sales</th><th>COGS</th>
+                      <th>Payment fees</th><th>OPEX</th><th>Net profit/day</th><th>BER</th><th>Est. orders/day</th>
                     </tr>
                   </thead>
                   <tbody>
                     {productResults.map(p => (
                       <tr key={p.id}>
-                        <td>{p.name}</td>
-                        <td>{p.currency}{displayCurrency !== p.currency ? ` → ${displayCurrency}` : ''}</td>
+                        <td>
+                          {p.name}
+                          {displayCurrency !== p.currency && <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 6 }}>{p.currency} → {displayCurrency}</span>}
+                        </td>
                         <td>{money(p.adSpend)}</td>
-                        <td>{num(p.roas)}</td>
                         <td>{money(p.netSales)}</td>
-                        <td>{money(p.varCosts)}</td>
+                        <td>{money(p.cogs)}</td>
+                        <td>{money(p.fees)}</td>
                         <td>{money(p.opex)}</td>
                         <td style={{ color: p.netProfit >= 0 ? '#047857' : '#b91c1c', fontWeight: 900 }}>{money(p.netProfit)}</td>
                         <td>{num(p.ber)}</td>
+                        <td>{p.dailyOrders > 0 ? p.dailyOrders : '—'}</td>
                       </tr>
                     ))}
-                    <tr className="strong-row">
-                      <td colSpan={2}>Total ({displayCurrency})</td>
-                      <td>{money(productResults.reduce((s, p) => s + p.adSpend, 0))}</td>
-                      <td>—</td>
-                      <td>{money(productResults.reduce((s, p) => s + p.netSales, 0))}</td>
-                      <td>{money(productResults.reduce((s, p) => s + p.varCosts, 0))}</td>
-                      <td>{money(productResults.reduce((s, p) => s + p.opex, 0))}</td>
-                      <td style={{ color: totalProfit >= 0 ? '#047857' : '#b91c1c', fontWeight: 900 }}>{money(totalProfit)}</td>
-                      <td>—</td>
-                    </tr>
+                    {productResults.length > 1 && (
+                      <tr className="strong-row">
+                        <td>Total</td>
+                        <td>{money(productResults.reduce((s, p) => s + p.adSpend, 0))}</td>
+                        <td>{money(productResults.reduce((s, p) => s + p.netSales, 0))}</td>
+                        <td>{money(productResults.reduce((s, p) => s + p.cogs, 0))}</td>
+                        <td>{money(productResults.reduce((s, p) => s + p.fees, 0))}</td>
+                        <td>{money(productResults.reduce((s, p) => s + p.opex, 0))}</td>
+                        <td style={{ color: totalProfit >= 0 ? '#047857' : '#b91c1c', fontWeight: 900 }}>{money(totalProfit)}</td>
+                        <td>—</td><td>—</td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
             </section>
           )}
 
+          {/* Scenario table */}
           {scenarioResults.length > 0 && (
             <section className="panel wide" style={{ marginBottom: 16 }}>
-              <PanelTitle title="Store net profit — simultaneous tests" subtitle="How much the store nets daily at each test count, across your three kill rule scenarios." />
+              <PanelTitle
+                title="Store net profit — simultaneous tests"
+                subtitle="Each column is one of your kill rules. Green = store positive, yellow = marginal, red = negative."
+              />
               <div className="table-card" style={{ marginTop: 14 }}>
                 <table>
                   <thead>
                     <tr>
                       <th>Tests running</th>
                       {scenarioResults.map(s => (
-                        <th key={s.label}>{s.label}<span className="th-note">{s.note}</span></th>
+                        <th key={s.id}>
+                          {s.label}
+                          <span className="th-note">{s.note}</span>
+                          <span className={`th-badge ${s.isKill ? 'kill' : 'continue'}`}>{s.isKill ? 'Kill' : 'Continue'}</span>
+                        </th>
                       ))}
                     </tr>
                   </thead>
@@ -453,9 +583,17 @@ function App() {
                         <td>{n === 0 ? '0 — no testing' : `${n} test${n > 1 ? 's' : ''}`}</td>
                         {scenarioResults.map(s => {
                           const net = s.storeNets[n];
+                          if (!s.isKill) {
+                            return (
+                              <td key={s.id}>
+                                <span className="net-val">{money(net)}</span>
+                                <span className="status-pill good">Self-funding</span>
+                              </td>
+                            );
+                          }
                           const cls = net >= 0 ? 'good' : net >= -25 ? 'warn' : 'bad';
                           return (
-                            <td key={s.label}>
+                            <td key={s.id}>
                               <span className={`net-val${net < 0 ? ' negative' : ''}`}>{money(net)}</span>
                               <span className={`status-pill ${cls}`}>{net >= 0 ? 'Positive' : net >= -25 ? 'Marginal' : 'Negative'}</span>
                             </td>
@@ -469,16 +607,29 @@ function App() {
             </section>
           )}
 
+          {/* Safe ceiling */}
           {scenarioResults.length > 0 && (
             <section className="panel wide" style={{ marginBottom: 16 }}>
-              <PanelTitle title="Safe test ceiling" subtitle="Maximum simultaneous tests before going store-negative, by scenario." />
-              <div className="recommendation-grid" style={{ marginTop: 14 }}>
+              <PanelTitle title="Safe test ceiling" subtitle="Maximum simultaneous tests before going store-negative, by rule." />
+              <div className="recommendation-grid" style={{ marginTop: 14, gridTemplateColumns: `repeat(${Math.min(scenarioResults.length, 4)}, 1fr)` }}>
                 {scenarioResults.map(s => {
+                  if (!s.isKill) {
+                    return (
+                      <div key={s.id} className="recommendation-card good">
+                        <div className="recommendation-top">
+                          <strong>∞</strong>
+                          <span>{s.label}</span>
+                        </div>
+                        <p>Test is self-funding. {s.description}</p>
+                        <small>No drag on winning products' profit.</small>
+                      </div>
+                    );
+                  }
                   const max = Math.max(0, s.maxTests);
                   const cls = max >= 3 ? 'good' : max >= 1 ? 'ok' : 'bad';
                   const label = { good: 'Plenty of room', ok: 'Limited runway', bad: 'No headroom' }[cls];
                   return (
-                    <div key={s.label} className={`recommendation-card ${cls}`}>
+                    <div key={s.id} className={`recommendation-card ${cls}`}>
                       <div className="recommendation-top">
                         <strong>{max} test{max !== 1 ? 's' : ''}</strong>
                         <span>{s.label}</span>
@@ -502,25 +653,10 @@ function App() {
 }
 
 function PanelTitle({ title, subtitle }) {
-  return (
-    <div className="panel-title">
-      <h2>{title}</h2>
-      {subtitle && <p>{subtitle}</p>}
-    </div>
-  );
+  return <div className="panel-title"><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div>;
 }
-
 function Field({ label, children }) {
   return <label className="field"><span>{label}</span>{children}</label>;
-}
-
-function KillStat({ label, value }) {
-  return (
-    <div style={{ textAlign: 'center' }}>
-      <div style={{ fontSize: 18, fontWeight: 900, color: '#0f172a', letterSpacing: '-.03em' }}>{value}</div>
-      <div style={{ fontSize: 11, color: 'var(--muted)', fontWeight: 700, marginTop: 2 }}>{label}</div>
-    </div>
-  );
 }
 
 createRoot(document.getElementById('root')).render(<App />);

@@ -1,53 +1,100 @@
 import { convertCurrency } from './fx';
 
-export async function calculateProduct(product, displayCurrency) {
+async function averageProcessorFee({ processors, aov, productCurrency, displayCurrency }) {
+  const active = processors.filter(p => p.active);
+  if (!active.length || !Number(aov)) return 0;
+  let total = 0;
+  for (const p of active) {
+    const aovDisplay = await convertCurrency(aov, productCurrency, displayCurrency);
+    const fixedDisplay = await convertCurrency(Number(p.fixed_fee || 0), p.fixed_fee_currency || displayCurrency, displayCurrency);
+    const processing = aovDisplay * (Number(p.percent_fee || 0) / 100) + fixedDisplay;
+    const conversion = productCurrency !== displayCurrency
+      ? aovDisplay * (Number(p.conversion_fee_percent || 0) / 100)
+      : 0;
+    total += processing + conversion;
+  }
+  return total / active.length;
+}
+
+export async function calculateProduct(product, processors, displayCurrency) {
   const adSpend = Number(product.daily_ad_spend || 0);
   const roas = Number(product.roas || 0);
-  const costPct = Number(product.variable_cost_pct || 0) / 100;
+  const cogsPct = Number(product.cogs_pct || 0) / 100;
+  const aov = Number(product.aov || 0);
   const opexLocal = Number(product.opex_share || 0);
   const currency = product.currency || 'USD';
 
   const netSalesLocal = roas * adSpend;
-  const varCostsLocal = costPct * netSalesLocal;
-  const netProfitLocal = netSalesLocal - adSpend - varCostsLocal - opexLocal;
-  const berLocal = (netSalesLocal - varCostsLocal - opexLocal) > 0
-    ? netSalesLocal / (netSalesLocal - varCostsLocal - opexLocal)
-    : 0;
+  const cogsLocal = cogsPct * netSalesLocal;
+  const dailyOrders = aov > 0 ? netSalesLocal / aov : 0;
 
-  if (!displayCurrency || currency === displayCurrency) {
-    return { adSpend, roas, costPct, opex: opexLocal, netSales: netSalesLocal, varCosts: varCostsLocal, netProfit: netProfitLocal, ber: berLocal, currency };
-  }
+  const feePerOrder = await averageProcessorFee({ processors, aov, productCurrency: currency, displayCurrency });
+  const totalFeesDisplay = feePerOrder * dailyOrders;
 
-  const [adSpendD, opexD, netSalesD, varCostsD, netProfitD] = await Promise.all([
+  const [adSpendD, netSalesD, cogsD, opexD] = await Promise.all([
     convertCurrency(adSpend, currency, displayCurrency),
-    convertCurrency(opexLocal, currency, displayCurrency),
     convertCurrency(netSalesLocal, currency, displayCurrency),
-    convertCurrency(varCostsLocal, currency, displayCurrency),
-    convertCurrency(netProfitLocal, currency, displayCurrency),
+    convertCurrency(cogsLocal, currency, displayCurrency),
+    convertCurrency(opexLocal, currency, displayCurrency),
   ]);
 
-  const berD = (netSalesD - varCostsD - opexD) > 0 ? netSalesD / (netSalesD - varCostsD - opexD) : 0;
+  const netProfit = netSalesD - adSpendD - cogsD - totalFeesDisplay - opexD;
+  const ber = (netSalesD - cogsD - totalFeesDisplay - opexD) > 0
+    ? netSalesD / (netSalesD - cogsD - totalFeesDisplay - opexD)
+    : 0;
 
-  return { adSpend: adSpendD, roas, costPct, opex: opexD, netSales: netSalesD, varCosts: varCostsD, netProfit: netProfitD, ber: berD, currency };
+  return {
+    adSpend: adSpendD, roas, cogsPct, aov,
+    cogs: cogsD, fees: totalFeesDisplay, opex: opexD,
+    netSales: netSalesD, netProfit, ber, currency,
+    dailyOrders: Math.round(dailyOrders * 10) / 10,
+  };
 }
 
+// Build scenario columns from dynamic kill profile rules
+// Each rule: { id, name, spend_threshold, condition, outcome }
+// outcome 'kill'     → daily burden = spend_threshold (burn, no revenue)
+// outcome 'continue' → daily burden = 0 (self-funding or profitable, not a drag)
 export function calculateScenarios(totalProfit, killProfile) {
   if (!killProfile) return [];
+  const rules = Array.isArray(killProfile.rules) ? killProfile.rules : [];
+  if (!rules.length) return [];
 
-  const testBudget = Number(killProfile.test_budget_per_day || 0);
-  const kill1 = Number(killProfile.kill1_no_atc || 0);
-  const kill2 = Number(killProfile.kill2_no_purchase || 0);
-  const kill3 = Number(killProfile.kill3_day2_no_sales || 0);
+  const CONDITIONS = {
+    no_atc: 'No ATC',
+    no_purchase: 'No purchase',
+    no_sales: 'No sales',
+    profitable: 'Profitable',
+    roas_below: 'ROAS below threshold',
+  };
 
-  const scenarios = [
-    { label: 'Best case', burn: kill1, note: `Kill Day 1 at $${kill1} — no ATC`, description: 'Killed on Day 1 before ATC. Lowest possible exposure per test.' },
-    { label: 'Typical', burn: kill2, note: `Kill Day 1 at $${kill2} — no purchase`, description: 'Killed on Day 1 after spend but no conversion. Most common outcome.' },
-    { label: 'Worst case', burn: (testBudget + kill3) / 2, note: `2-day avg: $${testBudget} Day 1 + $${kill3} Day 2`, description: `Full Day 1 run ($${testBudget}) then killed Day 2 ($${kill3} additional). Averaged over 2 days.` },
-  ];
+  return rules.map(rule => {
+    const threshold = Number(rule.spend_threshold || 0);
+    const isKill = rule.outcome === 'kill';
+    // For kill rules: daily burden = threshold (assumes spent in 1 day or averaged)
+    // For continue rules: burden = 0, test is self-funding
+    const burn = isKill ? threshold : 0;
 
-  return scenarios.map(s => ({
-    ...s,
-    maxTests: s.burn > 0 ? Math.floor(totalProfit / s.burn) : Infinity,
-    storeNets: [0, 1, 2, 3, 4, 5].map(n => totalProfit - n * s.burn),
-  }));
+    return {
+      id: rule.id,
+      label: rule.name || `${CONDITIONS[rule.condition] || rule.condition} at $${threshold}`,
+      threshold,
+      condition: CONDITIONS[rule.condition] || rule.condition,
+      outcome: rule.outcome,
+      isKill,
+      burn,
+      note: isKill
+        ? (rule.condition === 'roas_below'
+            ? `Kill at $${threshold} spend — ROAS < ${rule.roas_threshold ?? 'BEROAS'}`
+            : `Kill at $${threshold} spend — ${CONDITIONS[rule.condition] || rule.condition}`)
+        : `Continue — ${CONDITIONS[rule.condition] || rule.condition} at $${threshold}`,
+      description: isKill
+        ? (rule.condition === 'roas_below'
+            ? `Test killed at $${threshold} spend when ROAS drops below ${rule.roas_threshold ?? 'BEROAS'}. Full spend counted as daily loss.`
+            : `Test killed at $${threshold} spend. ${CONDITIONS[rule.condition] || rule.condition}. Full amount counted as daily loss.`)
+        : `Test continues running. ${CONDITIONS[rule.condition] || rule.condition} at $${threshold}. Assumed self-funding — no drag on winners.`,
+      maxTests: burn > 0 ? Math.floor(totalProfit / burn) : Infinity,
+      storeNets: [0, 1, 2, 3, 4, 5].map(n => totalProfit - n * burn),
+    };
+  });
 }
